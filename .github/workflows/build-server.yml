@@ -1,0 +1,157 @@
+name: Build and Test Server V6 Beta 2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. دریافت مخزن
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # 2. استخراج فایل سرور
+      - name: Extract Server ZIP
+        run: |
+          if [ ! -f "SmsCallBackup-Server-V6-Beta2.zip" ]; then
+            echo "ERROR: Server ZIP not found!"
+            ls -la
+            exit 1
+          fi
+
+          unzip -o SmsCallBackup-Server-V6-Beta2.zip -d server-project
+
+      # 3. پیدا کردن پوشه اصلی پروژه
+      - name: Find Server Project
+        run: |
+          REQ_FILE=$(find server-project -name requirements.txt -print -quit)
+
+          if [ -z "$REQ_FILE" ]; then
+            echo "ERROR: requirements.txt not found"
+            find server-project -maxdepth 5 -type f
+            exit 1
+          fi
+
+          SERVER_DIR=$(dirname "$REQ_FILE")
+
+          echo "SERVER_DIR=$SERVER_DIR" >> $GITHUB_ENV
+
+          echo "Server project found: $SERVER_DIR"
+
+      # 4. نصب Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # 5. نصب وابستگی‌ها
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r "$SERVER_DIR/requirements.txt"
+          pip install httpx
+
+      # 6. بررسی ساختار و Syntax
+      - name: Check Python Syntax
+        run: |
+          python -m compileall -q "$SERVER_DIR/app"
+
+      # 7. تست API و ثبت خودکار دستگاه
+      - name: Test API and Auto Enrollment
+        env:
+          DB_PATH: ${{ runner.temp }}/smscall-v6-test.db
+          RECEIVER_TOKEN: test_receiver_secret_123456789
+          SENDER_1_TOKEN: CHANGE_ME_SENDER_1
+          SENDER_2_TOKEN: CHANGE_ME_SENDER_2
+
+        run: |
+          PYTHONPATH="$SERVER_DIR" python - <<'PY'
+          import hashlib
+          import secrets
+
+          from fastapi.testclient import TestClient
+          from app.main import app
+
+          receiver_token = "test_receiver_secret_123456789"
+
+          receiver = {
+              "Authorization": f"Bearer {receiver_token}"
+          }
+
+          with TestClient(app) as client:
+
+              # Health check
+              r = client.get("/health")
+              assert r.status_code == 200
+
+              # ساخت اعتبارنامه آزمایشی Sender
+              sender_credential = secrets.token_hex(32)
+
+              credential_hash = hashlib.sha256(
+                  sender_credential.encode()
+              ).hexdigest()
+
+              # ثبت درخواست اتصال
+              enrollment = client.post(
+                  "/v1/enrollments",
+                  json={
+                      "device_name": "Test Samsung",
+                      "credential_hash": credential_hash
+                  }
+              )
+
+              assert enrollment.status_code == 200
+
+              request_id = enrollment.json()["request_id"]
+
+              assert enrollment.json()["state"] == "pending"
+
+              # مشاهده درخواست در Receiver
+              pending = client.get(
+                  "/v1/enrollments",
+                  headers=receiver
+              )
+
+              assert pending.status_code == 200
+              assert len(pending.json()["requests"]) == 1
+
+              # تأیید دستگاه
+              approval = client.post(
+                  f"/v1/enrollments/{request_id}/approve",
+                  headers=receiver
+              )
+
+              assert approval.status_code == 200
+              assert approval.json()["state"] == "approved"
+              assert approval.json()["sender_slot"] == "sender-1"
+
+              # بررسی وضعیت درخواست توسط Sender
+              sender = {
+                  "Authorization": f"Bearer {sender_credential}"
+              }
+
+              state = client.get(
+                  f"/v1/enrollments/{request_id}",
+                  headers=sender
+              )
+
+              assert state.status_code == 200
+              assert state.json()["state"] == "approved"
+
+              # آزمایش اتصال Sender
+              heartbeat = client.post(
+                  "/v1/heartbeat",
+                  headers=sender,
+                  json={}
+              )
+
+              assert heartbeat.status_code == 200
+              assert heartbeat.json()["role"] == "sender"
+
+              # ارسال بسته آزمایشی
+              upload = client.post(
+                  "/
